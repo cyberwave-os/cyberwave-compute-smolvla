@@ -1,0 +1,14 @@
+# Core dependencies for SmolVLA inference
+numpy>=1.24.0
+Pillow>=9.0.0
+requests>=2.28.0
+zstandard>=0.20.0  # For .tar.zst weights extraction
+
+# LeRobot with SmolVLA extras
+lerobot[smolvla]
+
+# LoRA fine-tuning
+peft
+
+# Cyberwave SDK for robot control
+cyberwave>=0.3.46

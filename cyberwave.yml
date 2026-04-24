@@ -1,0 +1,108 @@
+# Cyberwave Cloud Node configuration for SmolVLA
+#
+# This configuration enables SmolVLA inference and training for robot control.
+#
+# ============================================================================
+# INFERENCE
+# ============================================================================
+#
+# Model is loaded from local checkpoint (SMOLVLA_CHECKPOINT env var).
+# Robot control and camera frames are handled via Cyberwave SDK.
+#
+# Required environment variables (set by Cloud Node):
+#   - SMOLVLA_CHECKPOINT: Local path to SmolVLA checkpoint directory
+#   - CYBERWAVE_API_KEY: For MQTT and API authentication
+#   - CYBERWAVE_MQTT_HOST, CYBERWAVE_MQTT_PORT: MQTT broker details
+#
+# Expected inference JSON payload:
+#   {
+#     "robot_twin_uuid": "uuid-of-robot-twin",
+#     "instruction": "pick up the red block",
+#     "camera_endpoints_by_role": {
+#       "primary_camera": "camera-twin-uuid-1",
+#       "wrist_camera": "camera-twin-uuid-2"
+#     },
+#     "twin_calibration": {
+#       "joint_1": {"min": -2.0, "max": 2.0},
+#       ...
+#     },
+#     "calibration_robot_type": "follower",
+#     "max_steps": 50,
+#     "mode": "live"
+#   }
+#
+# Camera mapping:
+#   Training config contains camera names like "cam_7e7bf9fe" (non-semantic UUIDs).
+#   Runtime cameras are mapped by position: first runtime camera -> first training camera.
+#   Provide cameras via camera_endpoints_by_role (preferred) or camera_twin_uuids.
+#
+# ============================================================================
+# TRAINING
+# ============================================================================
+#
+# The training endpoint fine-tunes SmolVLA using PEFT/LoRA.
+# Metrics are sent to Cyberwave API (not WandB) via PUT /api/v1/mltrainings/{id}.
+# Upon completion, results are compressed to results_folder for upload.
+#
+# Required environment variables:
+#   - CYBERWAVE_API_KEY: For API authentication (or pass cyberwave_token in params)
+#   - CYBERWAVE_ENVIRONMENT: "production", "development", or "local"
+#   - CYBERWAVE_BASE_URL or CYBERWAVE_API_URL: e.g. http://localhost:8000 for local Docker API
+#
+# Local dev: run `train.py` after the CLI has written ~/.cyberwave/credentials.json (token + envs),
+# or export CYBERWAVE_BASE_URL and CYBERWAVE_API_KEY yourself. Use Python 3.12 or 3.13 (see install.sh).
+#
+# Expected training JSON payload:
+#   {
+#     "cyberwave_training_uuid": "uuid-of-training-job",
+#     "cyberwave_token": "api-token",              # Optional if CYBERWAVE_API_KEY set
+#     "dataset_uuid": "uuid-of-dataset",           # Dataset to download from API
+#     "dataset_name": "my-dataset",                # Directory name for dataset
+#     "data_root_dir": "./datasets",               # Root dir for datasets
+#     "base_model": "lerobot/smolvla_base",        # HF hub ID (default)
+#     "weights_url": "https://...",                # Optional: custom base weights tar
+#     "output_dir": "./outputs/train/run",         # Checkpoint output directory
+#     "max_steps": 50000,                          # Training steps (default: 50000)
+#     "batch_size": 32,                            # Batch size (default: 32)
+#     "num_workers": 12,                           # DataLoader workers (default: 12)
+#     "lora_r": 16,                                # LoRA rank (default: 16)
+#     "optimizer_lr": 1e-3,                        # Learning rate (default: 1e-3)
+#     "scheduler_decay_lr": 1e-4,                  # LR decay (default: 1e-4)
+#     "save_freq": 10000,                          # Checkpoint frequency (default: 10000)
+#     "log_freq": 100,                             # Logging frequency (default: 100)
+#     "compile_model": true,                       # Use torch.compile (default: true)
+#     "use_peft": true                             # Use PEFT/LoRA (default: true)
+#   }
+#
+# Training status updates are sent to:
+#   PUT /api/v1/mltrainings/{cyberwave_training_uuid}
+#   - update_type: "metrics" - step metrics (loss, etc.)
+#   - update_type: "estimate" - ETA updates after ~100 steps
+#   - status: "completed" / "failed" - final status
+#
+# ============================================================================
+
+cyberwave-cloud-node:
+  # Installation script - sets up Python venv and LeRobot dependencies
+  install_script: ./install.sh
+
+  # Inference endpoint - runs SmolVLA action prediction loop
+  # Loads model once, then processes frames and publishes actions via MQTT
+  inference: |
+    source "$HOME/.venv/smolvla/bin/activate" && \
+    python deploy.py {body}
+
+  # Training endpoint - fine-tunes SmolVLA with PEFT/LoRA
+  # Downloads dataset from Cyberwave API, runs training, compresses results
+  # Metrics sent to Cyberwave API (replaces WandB logging)
+  training: |
+    source "$HOME/.venv/smolvla/bin/activate" && \
+    python train.py {body}
+
+  # Results folder - directory where training outputs are saved
+  # Cloud Node scans this folder for files to upload after training completes
+  # Training produces a single {training_uuid}.tar.gz file here
+  results_folder: ./runs/artifacts
+  upload_results: true
+
+  profile_slug: smolvla-policy

@@ -1,6 +1,6 @@
-# SmolVLA Cyberwave Compute - Architecture
+# SmolVLA Cyberwave Cloud Node - Architecture
 
-This document explains the architecture of the SmolVLA inference and training systems for Cyberwave Cloud.
+This document explains the architecture of the SmolVLA inference and training systems for [Cyberwave](https://cyberwave.com) Cloud.
 
 **Table of Contents**
 - [Inference Architecture](#inference-architecture)
@@ -16,26 +16,26 @@ The inference system is split into three main components with distinct responsib
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         deploy.py                                │
+│                         deploy.py                               │
 │  ┌─────────────────────────────────────────────────────────────┐│
+│  │  • Parse request, download weights from Cyberwave API       ││
 │  │  • Load SmolVLA model (torch, PEFT adapters)                ││
 │  │  • Build predict_fn(inputs) -> raw tensor                   ││
-│  │  • Minimal: no camera/joint/Cyberwave logic                 ││
 │  └─────────────────────────────────────────────────────────────┘│
-│                              ↓ predict_fn, checkpoint            │
+│                              ↓ predict_fn, checkpoint           │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │                    cw_processor.py                           ││
-│  │  • Cyberwave SDK client + MQTT                              ││
-│  │  • Builds resolver from checkpoint + model_slug             ││
-│  │  • get_inputs(): camera frames → training names, state      ││
+│  │                    cw_processor.py                          ││
+│  │  • Cyberwave SDK client (auto-configured)                   ││
+│  │  • Background camera daemon threads                         ││
+│  │  • MQTT joint subscription + action publishing              ││
+│  │  • get_inputs(): cached frames + state                      ││
 │  │  • _convert_raw_actions(): tensor → [{_1, _2, ..._6}]       ││
-│  │  • Control loop, action publishing, gripper verification    ││
 │  └─────────────────────────────────────────────────────────────┘│
-│                              ↓ checkpoint                        │
+│                              ↓ checkpoint                       │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │                  smolvla_resolver.py                         ││
+│  │                  smolvla_resolver.py                        ││
 │  │  • Load train_config.json                                   ││
-│  │  • Extract training camera names                            ││
+│  │  • Extract training camera names + dimensions               ││
 │  │  • Build camera mapping (training ↔ runtime)                ││
 │  └─────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────┘
@@ -45,19 +45,26 @@ The inference system is split into three main components with distinct responsib
 
 ## Component Responsibilities
 
-### deploy.py - Model Loading Only
+### deploy.py - Entry Point & Model Loading
 
-**Purpose**: Entry point script that only handles ML model loading.
+**Purpose**: Entry point that handles weights download and ML model loading.
 
 | Task | Description |
 |------|-------------|
+| **Weights Download** | Fetches weights from `weights_url` via `download_weights()` |
 | **Model Loading** | Loads SmolVLA from checkpoint (supports full models & PEFT adapters) |
 | **Predict Function** | Creates `predict_fn` that takes inputs dict and returns raw tensor |
-| **Preprocessing** | Builds observation tensors and runs normalization |
 
 ```python
 # deploy.py main() simplified
-checkpoint = os.environ["SMOLVLA_CHECKPOINT"]
+request = parse_request_payload(sys.argv[1])
+
+# Download weights from Cyberwave MLModel API
+if request.weights_url:
+    checkpoint = download_weights(request.weights_url)
+else:
+    checkpoint = os.environ["SMOLVLA_CHECKPOINT"]
+
 predict_fn = build_predict_fn(checkpoint)
 
 processor = CwProcessor(
@@ -70,23 +77,6 @@ processor.setup()
 result = processor.run()
 ```
 
-The `predict_fn` signature:
-
-```python
-def predict(inputs: dict[str, Any]) -> torch.Tensor:
-    """
-    Args:
-        inputs: {
-            "images": {training_camera_name: np.ndarray HWC uint8},
-            "state": np.ndarray of joint positions,
-            "instruction": str
-        }
-    
-    Returns:
-        Raw action tensor [1, chunk_size, action_dim]
-    """
-```
-
 ### smolvla_resolver.py - Model-Specific Metadata
 
 **Purpose**: Handles SmolVLA-specific configuration and mappings. No torch, no Cyberwave imports.
@@ -95,22 +85,24 @@ def predict(inputs: dict[str, Any]) -> torch.Tensor:
 |------|-------------|
 | **Config Loading** | Reads `train_config.json` from checkpoint |
 | **Camera Extraction** | Extracts camera names used during training |
-| **Camera Mapping** | Maps training names to runtime identifiers by position |
+| **Dimension Extraction** | Extracts expected state/action dimensions |
+| **Camera Mapping** | Maps training names to runtime identifiers |
 
 ```python
 class SmolVLAResolver:
     MODEL_SLUG = "smolvla"
     
     def __init__(self, checkpoint: str) -> None:
-        self.checkpoint = checkpoint
         self.training_config = self._load_training_config()
         self.training_camera_names = self._extract_camera_names()
+        self.expected_state_dim = self._extract_state_dim()
+        self.expected_action_dim = self._extract_action_dim()
     
     def build_camera_mapping(
         self,
         runtime_cameras: dict[str, str] | list[str],
     ) -> dict[str, str]:
-        """Map training camera names to runtime identifiers (positional)."""
+        """Map training camera names to runtime identifiers."""
 ```
 
 ### cw_processor.py - Cyberwave I/O & Control Loop
@@ -119,13 +111,97 @@ class SmolVLAResolver:
 
 | Task | Description |
 |------|-------------|
-| **SDK Client** | Creates and configures Cyberwave client with API credentials |
-| **Resolver Management** | Builds resolver from checkpoint via `RESOLVER_REGISTRY` |
-| **Input Preparation** | `get_inputs()` fetches frames and remaps to training camera names |
-| **Action Conversion** | `_convert_raw_actions()` maps tensor to joint dicts `{_1, _2, ...}` |
-| **MQTT** | Connects, subscribes to joints, publishes actions |
-| **Control Loop** | Orchestrates observe → predict → convert → execute → repeat |
+| **Weights Download** | `download_weights()` fetches from MLModel API, extracts archives |
+| **SDK Client** | Creates Cyberwave client with auto-configured MQTT |
+| **Camera Bindings** | Creates `CameraBinding` per camera with background fetcher threads |
+| **Input Preparation** | `get_inputs()` reads cached frames (no I/O during inference) |
+| **Action Conversion** | `_convert_raw_actions()` maps tensor to joint dicts |
+| **MQTT** | Subscribes to joints, publishes actions |
 | **Gripper Verification** | Ensures gripper reaches target before proceeding |
+
+---
+
+## Weights Download Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     download_weights()                          │
+│                                                                 │
+│   1. GET /api/v1/mlmodels/{uuid}/weights                        │
+│      ├─ Response: { "signed_url": "...", "expires_at": "..." }  │
+│      └─ Extract signed_url from JSON                            │
+│                                                                 │
+│   2. GET {signed_url}                                           │
+│      └─ Stream download to temp file                            │
+│                                                                 │
+│   3. Detect archive type (magic bytes + headers)                │
+│      ├─ .tar.zst (0x28B52FFD) → zstandard + tarfile             │
+│      ├─ .tar.gz  (0x1F8B)     → tarfile                         │
+│      └─ .zip     (PK)         → zipfile                         │
+│                                                                 │
+│   4. Extract to ~/.cache/cyberwave/weights/{hash}/              │
+│                                                                 │
+│   5. Resolve model directory (find config.json)                 │
+│      ├─ Check base dir                                          │
+│      ├─ Check pretrained_model/                                 │
+│      └─ Recurse into single subdirectories (max depth 3)        │
+│                                                                 │
+│   6. Return resolved checkpoint path                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Background Camera Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    _setup_camera_bindings()                     │
+│                                                                 │
+│   For each camera in camera_mapping:                            │
+│   1. Extract UUID from endpoint URL                             │
+│   2. Fetch Twin object via SDK                                  │
+│   3. Create CameraBinding(role, twin_uuid, twin)                │
+│   4. Spawn daemon thread running _camera_loop()                 │
+│                                                                 │
+│   Wait for all cameras to fetch first frame (10s timeout)       │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      _camera_loop()                             │
+│                     (per-camera daemon thread)                  │
+│                                                                 │
+│   while not stop_event:                                         │
+│       raw = twin.get_latest_frame()                             │
+│       if len(raw) >= min_valid_bytes:                           │
+│           img = decode_jpeg(raw)  # PIL → numpy                 │
+│           with lock:                                            │
+│               binding.latest_bytes = raw                        │
+│               binding.latest_image = img                        │
+│               binding.last_ts = now()                           │
+│       sleep(poll_interval)  # default 50ms                      │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       get_inputs()                              │
+│                    (called by control loop)                     │
+│                                                                 │
+│   with lock:                                                    │
+│       for role, binding in cameras.items():                     │
+│           images[role] = binding.latest_image  # instant read   │
+│                                                                 │
+│   state = [joints[name] for name in joint_names]                │
+│   return {"images": images, "state": state, "instruction": ...} │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Benefits**:
+- Frame fetching is decoupled from inference loop
+- No I/O latency during `get_inputs()` - just reads cached numpy arrays
+- Consistent frame timing regardless of inference speed
+- TODO: Replace REST polling with WebRTC once available
 
 ---
 
@@ -133,48 +209,55 @@ class SmolVLAResolver:
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                        RUNTIME FLOW                             │
+│                        RUNTIME FLOW                            │
 ├────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  1. DEPLOY.PY - STARTUP                                         │
-│     ├─ Load SmolVLA model (PEFT if needed)                      │
-│     ├─ Create predict_fn                                        │
-│     └─ Create CwProcessor(model_slug, checkpoint, predict_fn)   │
-│                                                                 │
-│  2. CW_PROCESSOR - SETUP                                        │
-│     ├─ Build SmolVLAResolver from checkpoint                    │
-│     ├─ Connect to MQTT broker                                   │
-│     ├─ Subscribe to joint states                                │
-│     ├─ Wait for initial joint state (5s timeout)                │
-│     ├─ Derive joint_names (hardcoded: _1, _2, ..., _6)          │
-│     └─ Build camera_mapping via resolver                        │
-│                                                                 │
-│  3. CONTROL LOOP (repeat until max_steps)                       │
-│     │                                                           │
-│     ├─ GET_INPUTS                                               │
-│     │   ├─ Fetch camera frames                                  │
-│     │   ├─ Remap runtime keys → training camera names           │
-│     │   ├─ Decode JPEG → numpy arrays                           │
-│     │   ├─ Build state vector from joint positions              │
-│     │   └─ Return {"images": {...}, "state": [...], "instruction": ...}  │
-│     │                                                           │
-│     ├─ PREDICT                                                  │
-│     │   └─ raw_actions = predict_fn(inputs)                     │
-│     │       → Returns tensor [1, 50, action_dim]                │
-│     │                                                           │
-│     ├─ CONVERT_RAW_ACTIONS                                      │
-│     │   └─ tensor → [{_1: v, _2: v, ..., _6: v}, ...]           │
-│     │                                                           │
-│     └─ EXECUTE ACTIONS (first 25 of 50)                         │
-│         ├─ For each action:                                     │
-│         │   ├─ Publish via MQTT                                 │
-│         │   ├─ Sleep (0.1s)                                     │
-│         │   └─ If gripper closing: verify & retry               │
-│         └─ Re-observe and predict again                         │
-│                                                                 │
-│  4. COMPLETE                                                    │
-│     └─ Return summary JSON                                      │
-│                                                                 │
+│                                                                │
+│  1. DEPLOY.PY - STARTUP                                        │
+│     ├─ Parse request payload                                   │
+│     ├─ Download weights from Cyberwave MLModel API             │
+│     ├─ Load SmolVLA model (PEFT if needed)                     │
+│     ├─ Create predict_fn                                       │
+│     └─ Create CwProcessor(model_slug, checkpoint, predict_fn)  │
+│                                                                │
+│  2. CW_PROCESSOR - SETUP                                       │
+│     ├─ Create Cyberwave SDK client (auto-configured)           │
+│     ├─ Connect to MQTT broker                                  │
+│     ├─ Subscribe to joint states                               │
+│     ├─ Wait for initial joint state (5s timeout)               │
+│     ├─ Derive joint_names from twin schema                     │
+│     ├─ Build camera_mapping via resolver                       │
+│     ├─ Create CameraBinding + start background threads         │
+│     └─ Wait for all cameras ready (10s timeout)                │
+│                                                                │
+│  3. CONTROL LOOP (repeat until max_steps)                      │
+│     │                                                          │
+│     ├─ GET_INPUTS                                              │
+│     │   ├─ Read cached camera frames (instant, no I/O)         │
+│     │   ├─ Build state vector from joint positions             │
+│     │   └─ Return {"images": {...}, "state": [...], ...}       │
+│     │                                                          │
+│     ├─ PREDICT                                                 │
+│     │   └─ raw_actions = predict_fn(inputs)                    │
+│     │       → Returns tensor [1, 50, action_dim]               │
+│     │                                                          │
+│     ├─ CONVERT_RAW_ACTIONS                                     │
+│     │   └─ tensor → [{_1: v, _2: v, ..., _6: v}, ...]          │
+│     │                                                          │
+│     └─ EXECUTE ACTIONS (first 25 of 50)                        │
+│         ├─ For each action:                                    │
+│         │   ├─ Publish via MQTT                                │
+│         │   ├─ Sleep (0.1s)                                    │
+│         │   └─ If gripper closing: verify & retry              │
+│         └─ Re-observe and predict again                        │
+│                                                                │
+│  4. DISCONNECT                                                 │
+│     ├─ Signal camera threads to stop                           │
+│     ├─ Join all camera threads                                 │
+│     └─ Disconnect MQTT client                                  │
+│                                                                │
+│  5. RETURN RESULT                                              │
+│     └─ JSON with status, steps_executed, initial_joints        │
+│                                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -187,47 +270,50 @@ class SmolVLAResolver:
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      deploy.py                               │
-│                                                              │
-│   1. Parse request payload                                   │
-│   2. Load SmolVLA model → predict_fn                         │
-│   3. Pass checkpoint + predict_fn to CwProcessor             │
-│                                                              │
+│                      deploy.py                              │
+│                                                             │
+│   1. Parse request payload                                  │
+│   2. Download weights from weights_url                      │
+│   3. Load SmolVLA model → predict_fn                        │
+│   4. Pass checkpoint + predict_fn to CwProcessor            │
+│                                                             │
 └────────────────────────┬────────────────────────────────────┘
                          │ (model_slug, checkpoint, predict_fn)
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    cw_processor.py                           │
-│                                                              │
+│                    cw_processor.py                          │
+│                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │              SmolVLAResolver (built here)            │   │
-│   │  • training_camera_names: ["cam_7e7bf9fe", ...]     │   │
-│   │  • build_camera_mapping()                            │   │
+│   │              SmolVLAResolver (built here)           │   │
+│   │  • training_camera_names: ["camera_wrist", ...]     │   │
+│   │  • expected_state_dim: 6                            │   │
+│   │  • build_camera_mapping()                           │   │
 │   └─────────────────────────────────────────────────────┘   │
-│                                                              │
+│                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │                   MQTT Broker                        │   │
+│   │           Background Camera Threads                 │   │
+│   │  ◄──── GET /twins/{uuid}/latest-frame ────►         │   │
+│   │  ◄──── Cache decoded np.ndarray + bytes ────►       │   │
+│   └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│   ┌─────────────────────────────────────────────────────┐   │
+│   │                   MQTT Broker                       │   │
 │   │  ◄──── Subscribe to joint states ────►              │   │
 │   │  ◄──── Publish joint targets ────────►              │   │
 │   └─────────────────────────────────────────────────────┘   │
-│                                                              │
-│   ┌─────────────────────────────────────────────────────┐   │
-│   │                  Camera Twins                        │   │
-│   │  ◄──── GET /twins/{uuid}/latest-frame ────►         │   │
-│   └─────────────────────────────────────────────────────┘   │
-│                                                              │
-│   Control Loop:                                              │
+│                                                             │
+│   Control Loop:                                             │
 │     get_inputs() ──► predict_fn(inputs) ──► raw_tensor      │
-│                                                │             │
-│                                                ▼             │
-│                                 _convert_raw_actions()       │
-│                                                │             │
-│                                                ▼             │
-│                                      publish via MQTT        │
-│                                                │             │
-│                                                ▼             │
-│                                          Robot moves         │
-│                                                              │
+│                                                │            │
+│                                                ▼            │
+│                                 _convert_raw_actions()      │
+│                                                │            │
+│                                                ▼            │
+│                                      publish via MQTT       │
+│                                                │            │
+│                                                ▼            │
+│                                          Robot moves        │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -235,19 +321,34 @@ class SmolVLAResolver:
 
 ## Key Classes
 
+### CameraBinding
+
+```python
+@dataclass
+class CameraBinding:
+    """Holds state for a camera twin used by the inference loop."""
+    role: str                           # training_name (e.g. "camera_wrist")
+    twin_uuid: str                      # Extracted from endpoint URL
+    twin: Any                           # SDK Twin handle
+    latest_bytes: bytes = b""           # Raw JPEG bytes
+    latest_image: np.ndarray | None     # Decoded HWC uint8 RGB
+    last_ts: float = 0.0                # Timestamp of last successful fetch
+```
+
 ### InferenceRequest
 
 ```python
 @dataclass
 class InferenceRequest:
-    robot_twin_uuid: str           # Robot to control
-    instruction: str               # Task instruction
-    camera_twin_uuids: list[str]   # Camera UUIDs
-    camera_endpoints_by_role: dict # {"wrist_camera": "uuid", ...}
-    max_steps: int                 # Total actions to execute
-    actions_per_cycle: int         # Actions per inference (default: 25)
-    action_sleep_seconds: float    # Delay between actions (default: 0.1s)
-    inference_loop: bool           # Re-predict after each cycle (default: True)
+    robot_twin_uuid: str                    # Robot to control
+    instruction: str                        # Task instruction
+    camera_endpoints_by_role: dict[str, str]  # {"camera_wrist": "https://.../latest-frame"}
+    weights_url: str | None                 # MLModel weights API endpoint
+    policy_repo_id: str | None              # HuggingFace repo (fallback)
+    max_steps: int                          # Total actions to execute
+    actions_per_cycle: int                  # Actions per inference (default: 25)
+    action_sleep_seconds: float             # Delay between actions (default: 0.1s)
+    camera_poll_interval_seconds: float     # Background fetch interval (default: 0.05s)
 ```
 
 ### CwProcessor
@@ -261,20 +362,26 @@ class CwProcessor:
         model_slug: str,       # e.g., "smolvla"
         checkpoint: str,       # path to checkpoint
         predict_fn: PredictFn, # inputs dict -> raw tensor
+        cw: Cyberwave | None,  # optional injected client (for testing)
     ):
         # Builds resolver from RESOLVER_REGISTRY[model_slug](checkpoint)
+        self.cameras: dict[str, CameraBinding] = {}
+        self._camera_threads: list[threading.Thread] = []
     
     def setup(self) -> None:
-        """Initialize SDK, MQTT, build camera_mapping, derive joint_names."""
+        """Initialize SDK, MQTT, cameras, joint_names."""
     
     def get_inputs(self) -> dict[str, Any]:
-        """Fetch frames, remap to training names, build state vector."""
+        """Read cached frames and build inputs dict."""
     
     def _convert_raw_actions(self, raw: Any) -> list[dict[str, float]]:
         """Convert tensor to list of {_1, _2, ..., _6} dicts."""
     
     def run(self) -> dict[str, Any]:
         """Execute the full control loop."""
+    
+    def disconnect(self) -> None:
+        """Stop camera threads and disconnect MQTT."""
 ```
 
 ### SmolVLAResolver
@@ -284,9 +391,10 @@ class SmolVLAResolver:
     MODEL_SLUG = "smolvla"
     
     def __init__(self, checkpoint: str) -> None:
-        self.checkpoint = checkpoint
         self.training_config = self._load_training_config()
         self.training_camera_names = self._extract_camera_names()
+        self.expected_state_dim = self._extract_state_dim()
+        self.expected_action_dim = self._extract_action_dim()
     
     def build_camera_mapping(
         self,
@@ -301,12 +409,10 @@ class SmolVLAResolver:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `SMOLVLA_CHECKPOINT` | Yes | Path to SmolVLA checkpoint directory |
-| `SMOLVLA_BASE_MODEL` | No | For PEFT: path to base model |
 | `CYBERWAVE_API_KEY` | Yes | API key for Cyberwave authentication |
-| `CYBERWAVE_MQTT_HOST` | No | MQTT broker host |
-| `CYBERWAVE_MQTT_PORT` | No | MQTT broker port |
-| `CYBERWAVE_MQTT_PASSWORD` | No | MQTT password (defaults to API key) |
+| `SMOLVLA_CHECKPOINT` | No | Override checkpoint path (otherwise uses weights_url) |
+| `CYBERWAVE_MQTT_HOST` | No | MQTT broker host (auto-configured by SDK) |
+| `CYBERWAVE_MQTT_PORT` | No | MQTT broker port (auto-configured by SDK) |
 
 ---
 
@@ -333,7 +439,7 @@ if gripper_target < 0.3:
 
 The architecture supports adding new models (e.g., OpenVLA) by:
 
-1. Creating a new resolver (e.g., `openvla_resolver.py`) implementing the `ModelResolver` protocol
+1. Creating a new resolver (e.g., `openvla_resolver.py`) implementing the `BaseVLAResolver` protocol
 2. Registering it in `RESOLVER_REGISTRY` in `cw_processor.py`
 3. Creating a new `deploy_openvla.py` with model-specific loading
 
@@ -352,9 +458,8 @@ RESOLVER_REGISTRY = {
 ```bash
 # Set environment
 export CYBERWAVE_API_KEY="cw_your_api_key"
-export SMOLVLA_CHECKPOINT="/path/to/checkpoint"
 
-# Run inference
+# Run inference (weights downloaded from weights_url in params)
 python deploy.py test_params.json
 ```
 
@@ -362,14 +467,15 @@ python deploy.py test_params.json
 
 ```json
 {
-  "robot_twin_uuid": "b10e8ffa-f58c-49e0-a9c0-f76ffbed0356",
-  "instruction": "pick up the red block and place it in the box",
+  "robot_twin_uuid": "e305bb3e-8c5f-4bf7-807b-21cdb24c88fc",
+  "instruction": "put object in box",
+  "weights_url": "https://api.cyberwave.com/api/v1/mlmodels/{uuid}/weights",
+  "policy_repo_id": "lerobot/smolvla_base",
   "camera_endpoints_by_role": {
-    "wrist_camera": "d62cf8b3-9533-496a-95a6-34e8188a885a",
-    "top_camera": "69938649-de93-4db1-bd7e-c413114525c0",
-    "front_camera": "3d1f467f-500c-45fe-a754-537acdb7b464"
+    "camera_wrist": "https://api.cyberwave.com/api/v1/twins/{uuid}/latest-frame",
+    "camera_front": "https://api.cyberwave.com/api/v1/twins/{uuid}/latest-frame"
   },
-  "max_steps": 100,
+  "max_steps": 1000,
   "actions_per_cycle": 25,
   "action_sleep_seconds": 0.1,
   "inference_loop": true
@@ -383,34 +489,40 @@ python deploy.py test_params.json
 The system produces colorized terminal output showing:
 
 ```
+  Fetching weights from https://api.cyberwave.com/api/v1/mlmodels/...
+  Got signed URL (expires: 2026-04-24T15:59:23+00:00)
+  Downloading from signed URL...
+  Extracting TAR.ZST archive...
+  Resolved model directory: /root/.cache/cyberwave/weights/.../pretrained_model
+  ✓ Weights downloaded to ...
+
 ══════════════════════════════════════════════════
   CYBERWAVE SETUP
 ══════════════════════════════════════════════════
-  API Key: cw_dffac...2048
+  API Key: cw_a9ce8...4bea
   ✓ Client created
   ✓ MQTT connected
-  ✓ Joints received: [0.01, -1.54, 1.48, 0.03, 0.01, 0.31]
-  Joint names: ['_1', '_2', '_3', '_4', '_5', '_6']
-  Camera mapping: 3 cameras
-    cam_7e7bf9fe <- wrist_camera
-    cam_9fcace87 <- top_camera
-    cam_a6f944f4 <- front_camera
+  ✓ Joints received: [-0.01, 0.01, 0.07, 0.02, -0.00, 0.12]
+  ✓ Joint count matches model: 6 joints
+  ✓ Camera camera_wrist ready
+  ✓ Camera camera_front ready
+  Started 2 background camera fetchers
 
 ══════════════════════════════════════════════════
   SMOLVLA CONTROL LOOP
 ══════════════════════════════════════════════════
-  Max steps:        100
+  Max steps:        1000
   Actions/cycle:    25
   Joint source:     mqtt_subscription
 
 ──────────────────────────────────────────────────
-  CYCLE 1  │  0/100 steps (0%)
+  CYCLE 1  │  0/1000 steps (0%)
 ──────────────────────────────────────────────────
-  Cameras: 3 frames  │  State dim: 6
-  State: [0.01, -1.54, 1.48, 0.03, 0.01, 0.31]
+  Cameras: 2 frames  │  State dim: 6
+  State: [-0.01, 0.01, 0.07, 0.02, -0.00, 0.12]
   Running inference...
   Predicted 50 actions -> executing 25
-  [████████████████████] 25/25  ✋ [+0.11, -1.32, +1.35, +0.25, -0.26, +0.18]
+  [████████████████████] 25/25  ✊ [+0.11, -0.00, +0.19, +0.41, -0.15, +0.10]
   ✓ Executed 25 actions
 ```
 
@@ -426,15 +538,15 @@ The training system mirrors the inference architecture with a parallel set of co
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         train.py                                 │
+│                         train.py                                │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │  • SmolVLA entry point (MODEL_SLUG = "smolvla")             ││
 │  │  • Parse JSON params from Cloud Node                        ││
 │  │  • Instantiate CwTrainer and run training                   ││
 │  └─────────────────────────────────────────────────────────────┘│
-│                              ↓ params, model_slug                │
+│                              ↓ params, model_slug               │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │                    cw_trainer.py                             ││
+│  │                    cw_trainer.py                            ││
 │  │  • Download dataset from Cyberwave API                      ││
 │  │  • Download base model weights (optional)                   ││
 │  │  • Monkey-patch WandBLogger → CyberwaveLogger               ││
@@ -442,9 +554,9 @@ The training system mirrors the inference architecture with a parallel set of co
 │  │  • Execute lerobot train(), send status/metrics/ETA         ││
 │  │  • Compress results to results_folder                       ││
 │  └─────────────────────────────────────────────────────────────┘│
-│                              ↓ params                            │
+│                              ↓ params                           │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │                  smolvla_trainer.py                          ││
+│  │                  smolvla_trainer.py                         ││
 │  │  • Build TrainPipelineConfig for SmolVLA                    ││
 │  │  • Configure PEFT/LoRA settings                             ││
 │  │  • Set learning rate, batch size, steps                     ││
@@ -575,40 +687,40 @@ The logger also computes and sends ETA after ~100 steps via `update_type="estima
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    cw_trainer.py                             │
-│                                                              │
+│                    cw_trainer.py                            │
+│                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │              Cyberwave API                           │   │
+│   │              Cyberwave API                          │   │
 │   │  ──► GET /datasets/{uuid}/zip (download dataset)    │   │
 │   │  ──► GET weights_url (download base model)          │   │
 │   │  ◄── PUT /mltrainings/{uuid} (metrics, ETA)         │   │
 │   │  ◄── PUT /mltrainings/{uuid} (completion)           │   │
 │   └─────────────────────────────────────────────────────┘   │
-│                                                              │
+│                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │              SmolVLATrainer (registry lookup)        │   │
+│   │              SmolVLATrainer (registry lookup)       │   │
 │   │  • build_pipeline_config() → TrainPipelineConfig    │   │
 │   └─────────────────────────────────────────────────────┘   │
-│                                                              │
+│                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │              CyberwaveLogger (monkey-patched)        │   │
-│   │  • Replaces WandBLogger                              │   │
+│   │              CyberwaveLogger (monkey-patched)       │   │
+│   │  • Replaces WandBLogger                             │   │
 │   │  • log_dict() → PUT /mltrainings/{uuid}             │   │
 │   └─────────────────────────────────────────────────────┘   │
-│                                                              │
+│                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │              lerobot train(cfg)                      │   │
-│   │  • Loads dataset                                     │   │
+│   │              lerobot train(cfg)                     │   │
+│   │  • Loads dataset                                    │   │
 │   │  • Fine-tunes model with PEFT/LoRA                  │   │
-│   │  • Saves checkpoints                                 │   │
+│   │  • Saves checkpoints                                │   │
 │   └─────────────────────────────────────────────────────┘   │
-│                                                              │
+│                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │              Results Compression                     │   │
-│   │  • tar.gz checkpoint → results_folder               │   │
+│   │              Results Compression                    │   │
+│   │  • tar.zst checkpoint → results_folder              │   │
 │   │  • Cloud Node uploads to storage                    │   │
 │   └─────────────────────────────────────────────────────┘   │
-│                                                              │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -631,9 +743,11 @@ GET {signed_url}
 ### 2. Weights Download (Optional)
 
 ```
-GET {weights_url}
-    → If JSON: { "signed_url": "...", "checkpoint_path": "..." }
-    → Otherwise: Direct tar download
+GET /api/v1/mlmodels/{uuid}/weights
+    → Returns: { "signed_url": "...", "expires_at": "..." }
+
+GET {signed_url}
+    → Returns: tar.zst archive
 ```
 
 ### 3. Metrics Updates
@@ -658,7 +772,7 @@ PUT /api/v1/mltrainings/{training_uuid}
 PUT /api/v1/mltrainings/{training_uuid}
 {
     "metadata": {
-        "estimated_end_time": "2025-01-15T18:30:00Z",
+        "estimated_end_time": "2026-01-15T18:30:00Z",
         "estimated_remaining_seconds": 14400,
         "estimated_remaining_human": "4h 0m",
         "max_steps": 50000,
@@ -676,46 +790,9 @@ PUT /api/v1/mltrainings/{training_uuid}
     "status": "completed",
     "metadata": {
         "completion_source": "cw_trainer.py",
-        "local_checkpoint_path": "./runs/artifacts/uuid.tar.gz"
+        "local_checkpoint_path": "./runs/artifacts/uuid.tar.zst"
     }
 }
-```
-
----
-
-## Extending Training to Other Models
-
-The training architecture supports adding new models by:
-
-1. **Create a new trainer** (e.g., `openvla_trainer.py`) implementing `BaseVLATrainer`
-2. **Register in trainer registry** in `cw_trainer.py`
-3. **Create entry point** (e.g., `train_openvla.py`) with the appropriate `MODEL_SLUG`
-
-```python
-# base_trainer.py
-class BaseVLATrainer(ABC):
-    MODEL_SLUG: str
-    
-    @abstractmethod
-    def build_pipeline_config(self, params, *, dataset_root, ...):
-        pass
-
-# openvla_trainer.py (future)
-class OpenVLATrainer(BaseVLATrainer):
-    MODEL_SLUG = "openvla"
-    
-    def build_pipeline_config(self, ...):
-        # OpenVLA-specific config
-        pass
-
-# cw_trainer.py
-def _get_trainer_registry():
-    from smolvla_trainer import SmolVLATrainer
-    # from openvla_trainer import OpenVLATrainer  # future
-    return {
-        SmolVLATrainer.MODEL_SLUG: SmolVLATrainer,
-        # OpenVLATrainer.MODEL_SLUG: OpenVLATrainer,
-    }
 ```
 
 ---
@@ -793,13 +870,13 @@ Received 12 parameters
   Status: training
   Starting lerobot training...
   [Cyberwave] Logged 5 metrics at step 100
-  [Cyberwave] Updated ETA: 2025-01-15T18:30:00Z (~4h 0m remaining)
+  [Cyberwave] Updated ETA: 2026-01-15T18:30:00Z (~4h 0m remaining)
   ...
 
 --- Compression Phase ---
   Status: compressing
-  Compressing ./outputs/train/abc123/checkpoints/last -> ./runs/artifacts/abc123-def456.tar.gz
-  Artifact created: ./runs/artifacts/abc123-def456.tar.gz (1234.5MB)
+  Compressing ./outputs/train/abc123/checkpoints/last -> ./runs/artifacts/abc123-def456.tar.zst
+  Artifact created: ./runs/artifacts/abc123-def456.tar.zst (1234.5MB)
 
 --- Completion ---
   Completion status sent to Cyberwave
@@ -808,5 +885,5 @@ Received 12 parameters
   Training Complete
 ============================================================
 
-{"status": "completed", "artifact": "./runs/artifacts/abc123-def456.tar.gz", "training_uuid": "abc123-def456"}
+{"status": "completed", "artifact": "./runs/artifacts/abc123-def456.tar.zst", "training_uuid": "abc123-def456"}
 ```

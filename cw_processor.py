@@ -765,7 +765,7 @@ class CwProcessor:
             except Exception as exc:
                 logger.warning("Failed to fetch twin calibration: %s", exc)
 
-        # Connect MQTT explicitly 
+        # Connect MQTT explicitly
         cprint("  Connecting to MQTT...", C.CYAN)
         try:
             self.client.mqtt.connect()
@@ -774,7 +774,7 @@ class CwProcessor:
             cprint(f"  ✗ MQTT connection failed: {exc}", C.RED)
             raise RuntimeError(f"MQTT connection failed: {exc}")
 
-        # Subscribe to joint states 
+        # Subscribe to joint states
         cprint("  Subscribing to joint states...", C.CYAN)
         try:
             self.client.mqtt.subscribe_joint_states(
@@ -1289,7 +1289,7 @@ class CwProcessor:
                 "CwProcessor.setup() must be called before publish_actions()"
             )
 
-        # Build publish kwargs 
+        # Build publish kwargs
         publish_kwargs: dict[str, Any] = {
             "twin_uuid": self.request.robot_twin_uuid,
             "joint_positions": actions,

@@ -435,8 +435,14 @@ _PREVIEW_BASE_MODEL = "lerobot/smolvla_base"
 def _resolve_checkpoint(payload: dict[str, Any]) -> str:
     """Return the checkpoint for a preview run.
 
-    Priority: ``SMOLVLA_CHECKPOINT`` env, then ``payload["checkpoint"]`` (from
-    model metadata / robot_context), then the default base model id.
+    Preview nodes load weights from a fixed path baked into the image / VM
+    (``SMOLVLA_CHECKPOINT``). The playground payload may carry an optional HF
+    hub id hint in ``checkpoint`` when the node was not pre-configured.
+
+    Priority:
+      1. ``SMOLVLA_CHECKPOINT`` env (production / Docker default)
+      2. ``payload["checkpoint"]`` — HuggingFace hub id hint from model metadata
+      3. default base model id
     """
     checkpoint = os.environ.get("SMOLVLA_CHECKPOINT", "").strip()
     if checkpoint:
@@ -614,14 +620,13 @@ def main(argv: list[str] | None = None) -> int:
     # ------------------------------------------------------------------
     logger.info("Routing to preview inference")
 
-    # Hot server and cold-start must agree on weights: if the GPU node never set
-    # SMOLVLA_CHECKPOINT, inherit the same hint the playground payload / metadata uses
-    # (e.g. lerobot/smolvla_base) so preview_server can load from HF too.
+    # Hot server and cold-start must agree on weights (fixed node checkpoint or HF hint).
     if not os.environ.get("SMOLVLA_CHECKPOINT", "").strip():
         ckpt = _resolve_checkpoint(payload)
         os.environ["SMOLVLA_CHECKPOINT"] = ckpt
         logger.info(
-            "SMOLVLA_CHECKPOINT was unset — using preview checkpoint %r for hot server + cold start.",
+            "SMOLVLA_CHECKPOINT was unset — resolved preview checkpoint %r "
+            "for hot server + cold start.",
             ckpt,
         )
 
@@ -650,7 +655,11 @@ def _maybe_upload_result(payload: dict[str, Any], result: dict[str, Any]) -> Non
     """Upload result to backend if we have the necessary credentials in the payload."""
     workload_uuid = payload.get("workload_uuid") or (result or {}).get("workload_uuid")
     api_token = payload.get("cyberwave_token") or os.environ.get("CYBERWAVE_API_KEY", "")
-    api_base_url = os.environ.get("CYBERWAVE_BASE_URL", "http://localhost:8000")
+    api_base_url = (
+        os.environ.get("CYBERWAVE_API_URL")
+        or os.environ.get("CYBERWAVE_BASE_URL")
+        or "http://localhost:8000"
+    )
 
     if not workload_uuid:
         logger.warning("No workload_uuid in payload — skipping backend result upload")

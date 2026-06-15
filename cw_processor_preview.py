@@ -49,11 +49,29 @@ def decode_base64_image(image_b64: str) -> np.ndarray:
     try:
         from PIL import Image as PILImage
 
-        raw_bytes = base64.b64decode(image_b64)
+        raw = image_b64
+        if raw.startswith("data:") and "," in raw:
+            raw = raw.split(",", 1)[1]
+        raw_bytes = base64.b64decode(raw)
         pil_img = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
         return np.array(pil_img, dtype=np.uint8)
     except Exception as e:
         logger.error("Failed to decode base64 image: %s", e)
+        raise
+
+
+def fetch_image_from_url(image_url: str) -> np.ndarray:
+    """Download an observation frame from a signed URL (playground dispatch)."""
+    import requests
+    from PIL import Image as PILImage
+
+    try:
+        response = requests.get(image_url, timeout=60)
+        response.raise_for_status()
+        pil_img = PILImage.open(io.BytesIO(response.content)).convert("RGB")
+        return np.array(pil_img, dtype=np.uint8)
+    except Exception as e:
+        logger.error("Failed to fetch image from %s: %s", image_url[:80], e)
         raise
 
 
@@ -74,7 +92,15 @@ class PreviewRequest:
         self.family: str = str(payload.get("family") or "smolvla")
         self.prompt: str = str(payload.get("prompt") or "")
         self.image_base64: str | None = payload.get("image_base64")
+        self.image_url: str | None = payload.get("image_url")
         self.workload_uuid: str | None = payload.get("workload_uuid")
+        self.observation_state: list[float] | None = None
+        raw_obs = payload.get("observation")
+        if isinstance(raw_obs, dict) and isinstance(raw_obs.get("state"), list):
+            try:
+                self.observation_state = [float(v) for v in raw_obs["state"]]
+            except (TypeError, ValueError):
+                self.observation_state = None
 
         robot: dict[str, Any] = {}
         raw_robot = payload.get("robot")
@@ -155,10 +181,12 @@ class CwProcessorPreview:
         *training* camera short names (e.g. "cam_7e7bf9fe").  For preview we
         only have one image, so we replicate it across all expected camera slots.
         """
-        if not self.request.image_base64:
-            raise ValueError("No image_base64 in preview payload.")
-
-        primary = decode_base64_image(self.request.image_base64)
+        if self.request.image_base64:
+            primary = decode_base64_image(self.request.image_base64)
+        elif self.request.image_url:
+            primary = fetch_image_from_url(self.request.image_url)
+        else:
+            raise ValueError("No image_base64 or image_url in preview payload.")
 
         if self.training_camera_names:
             # Replicate the single image across all training slots.
@@ -168,22 +196,33 @@ class CwProcessorPreview:
         return {_PREVIEW_CAMERA_SLOT: primary}
 
     def _build_state(self) -> np.ndarray:
-        """Build zero proprio state vector sized to what the model expects.
-
-        We use state_dim (from the training checkpoint config) as the
-        authoritative dimension — the model was trained on exactly this many
-        proprio values and will truncate/reject anything else.  robot_dof is
-        informational only; it describes the real robot, which may differ from
-        the training embodiment.
-
-        Falls back to robot_dof if state_dim is unavailable (e.g. HF Hub
-        base weights with no local train_config.json).
-        """
+        """Build proprio state from ``observation.state`` or zeros as fallback."""
         dim = self.state_dim if self.state_dim > 0 else self.request.robot_dof
         if dim <= 0:
             return np.zeros(0, dtype=np.float32)
 
-        logger.info("Building zero proprio state (dim=%d, model state_dim).", dim)
+        if self.request.observation_state:
+            arr = np.asarray(self.request.observation_state, dtype=np.float32).reshape(-1)
+            if arr.size == dim:
+                logger.info("Using observation.state proprio (dim=%d).", dim)
+                return arr
+            if arr.size > dim:
+                logger.info(
+                    "Truncating observation.state from %d to %d dims.",
+                    arr.size,
+                    dim,
+                )
+                return arr[:dim]
+            padded = np.zeros(dim, dtype=np.float32)
+            padded[: arr.size] = arr
+            logger.info(
+                "Padding observation.state from %d to %d dims.",
+                arr.size,
+                dim,
+            )
+            return padded
+
+        logger.info("Building zero proprio state (dim=%d).", dim)
         return np.zeros(dim, dtype=np.float32)
 
     def _format_action_output(self, raw_actions: Any) -> dict[str, Any]:

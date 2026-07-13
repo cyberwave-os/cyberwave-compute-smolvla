@@ -523,6 +523,39 @@ def build_predict_fn(
             "SMOLVLA_SKIP_GPU_WARMUP set: skipping GPU warmup (first inference may be very slow)"
         )
 
+    # Expose the camera short-names the policy was trained with so callers
+    # (e.g. CwProcessorPreview) can build the images dict with the correct keys
+    # without needing a separate resolver pass.
+    predict.training_camera_names = [  # type: ignore[attr-defined]
+        key.split("observation.images.")[-1]
+        for key, pf in cfg.input_features.items()
+        if pf.type == FeatureType.VISUAL and "empty_camera" not in key
+    ]
+    predict.expected_state_dim = expected_state_dim  # type: ignore[attr-defined]
+
+    # action_out_dim = int(ds_features[ACTION]["shape"][0])
+    # predict.action_dim = action_out_dim  # type: ignore[attr-defined]
+    # _chunk_raw = getattr(cfg, "chunk_size", None)
+    # if _chunk_raw is None:
+    #     _chunk_raw = getattr(cfg, "n_action_steps", None)
+    # try:
+    #     chunk_size_int = int(_chunk_raw) if _chunk_raw is not None else 0
+    # except (TypeError, ValueError):
+    #     chunk_size_int = 0
+    # predict.chunk_size = chunk_size_int  # type: ignore[attr-defined]
+
+    # # CHW training layout from policy; preview clients send HWC uint8 (see cw_processor_preview).
+    # predict.image_input_specs = {  # type: ignore[attr-defined]
+    #     key.split("observation.images.")[-1]: {
+    #         "layout": "CHW",
+    #         "channels": int(pf.shape[0]),
+    #         "height": int(pf.shape[1]),
+    #         "width": int(pf.shape[2]),
+    #     }
+    #     for key, pf in cfg.input_features.items()
+    #     if pf.type == FeatureType.VISUAL and "empty_camera" not in key
+    # }
+
     return predict
 
 

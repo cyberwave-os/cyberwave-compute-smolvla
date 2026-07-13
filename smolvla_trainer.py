@@ -48,6 +48,27 @@ def _detect_device() -> str:
     return "cpu"
 
 
+def _resolve_max_steps(params: dict[str, Any], *, default: int = 50000) -> int:
+    """Resolve the total number of training steps, supporting step/iteration synonyms.
+
+    Precedence (highest first):
+      1. Explicit top-level ``max_steps`` / ``steps`` / ``iterations`` /
+         ``max_iterations`` — set via the JSON payload or the cyberwave.yml
+         ``config.train`` block. This lets an operator cap a run (e.g. a smoke
+         test) regardless of what the training request asked for.
+      2. ``policy.max_iterations`` from the training-request payload.
+      3. ``default``.
+    """
+    for key in ("max_steps", "steps", "iterations", "max_iterations"):
+        val = params.get(key)
+        if val is not None:
+            return int(val)
+    policy_block = params.get("policy")
+    if isinstance(policy_block, dict) and policy_block.get("max_iterations") is not None:
+        return int(policy_block["max_iterations"])
+    return default
+
+
 class SmolVLATrainer(BaseVLATrainer):
     """SmolVLA trainer that builds configs for PEFT/LoRA fine-tuning."""
 
@@ -134,10 +155,7 @@ class SmolVLATrainer(BaseVLATrainer):
         from lerobot.configs.default import DatasetConfig, PeftConfig, WandBConfig
         from lerobot.configs.train import TrainPipelineConfig
 
-        policy_block = params.get("policy")
-        max_steps = params.get("max_steps", 50000)
-        if isinstance(policy_block, dict) and policy_block.get("max_iterations") is not None:
-            max_steps = int(policy_block["max_iterations"])
+        max_steps = _resolve_max_steps(params)
 
         policy_cfg = self._load_policy_config(base_model_path)
         policy_cfg.device = params.get("device") or _detect_device()
@@ -166,7 +184,10 @@ class SmolVLATrainer(BaseVLATrainer):
                 video_backend=params.get("video_backend", "pyav"),
             ),
             policy=policy_cfg,
-            output_dir=str(output_dir),
+            # Must be a Path, not str: lerobot builds checkpoint paths via
+            # ``cfg.output_dir / "checkpoints" / ...`` and a str crashes the
+            # first checkpoint with ``unsupported operand type(s) for /``.
+            output_dir=output_dir,
             batch_size=params.get("batch_size", 32),
             steps=max_steps,
             eval_freq=params.get("eval_freq", 0),

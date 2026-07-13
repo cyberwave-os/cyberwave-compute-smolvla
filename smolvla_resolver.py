@@ -39,6 +39,7 @@ class SmolVLAResolver(BaseVLAResolver):
         self.training_camera_names = self._extract_camera_names()
         self.expected_state_dim = self._extract_state_dim()
         self.expected_action_dim = self._extract_action_dim()
+        self.chunk_size = self._extract_chunk_size()
 
     def _load_training_config(self) -> dict[str, Any] | None:
         """Load train_config.json from checkpoint directory.
@@ -135,6 +136,24 @@ class SmolVLAResolver(BaseVLAResolver):
 
         return 0
 
+    def _extract_chunk_size(self) -> int:
+        """Best-effort action horizon from train_config (policy chunk_size / aliases)."""
+        if not self.training_config:
+            return 0
+        policy = self.training_config.get("policy")
+        if isinstance(policy, dict):
+            for key in ("chunk_size", "n_action_steps", "horizon"):
+                raw = policy.get(key)
+                if isinstance(raw, bool):
+                    continue
+                if isinstance(raw, (int, float)) and int(raw) > 0:
+                    return int(raw)
+        for key in ("chunk_size", "n_action_steps"):
+            raw = self.training_config.get(key)
+            if isinstance(raw, (int, float)) and int(raw) > 0:
+                return int(raw)
+        return 0
+
     def get_expected_state_dim(self) -> int:
         """Return expected state dimension (number of input joints)."""
         return self.expected_state_dim
@@ -142,6 +161,10 @@ class SmolVLAResolver(BaseVLAResolver):
     def get_expected_action_dim(self) -> int:
         """Return expected action dimension (number of output joints)."""
         return self.expected_action_dim
+
+    def get_chunk_size(self) -> int:
+        """Return policy action chunk length (0 if unknown)."""
+        return int(self.chunk_size or 0)
 
     def build_camera_mapping(
         self,

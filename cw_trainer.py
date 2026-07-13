@@ -772,7 +772,10 @@ class CwTrainer:
         self.output_dir = Path(
             self.params.get("output_dir", f"./outputs/train/{self.training_uuid or 'run'}")
         )
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Do NOT pre-create output_dir. lerobot's TrainPipelineConfig.validate()
+        # raises when the dir already exists (resume is off), and lerobot creates
+        # it itself at checkpoint time. The path is unique per training UUID, so
+        # it will not collide across runs.
 
         cprint("  Building training config...", C.CYAN)
         self.training_cfg = self.trainer.build_pipeline_config(

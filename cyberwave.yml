@@ -1,5 +1,18 @@
 # Cyberwave Cloud Node configuration for SmolVLA
 #
+# Architecture:
+#   smolvla/
+#     install.sh              — venv + pip install lerobot + cyberwave SDK
+#     deploy.py               — inference entrypoint  → CwProcessor + build_predict_fn
+#     train.py                — training entrypoint   → CwTrainer + LeRobot training loop
+#     preview.py              — preview entrypoint    → hot server or cold-start CwProcessorPreview
+#     preview_server.py       — long-running FastAPI server: loads model once, serves /predict
+#     cw_processor.py         — shared live-inference layer (MQTT, cameras, action loop)
+#     cw_processor_preview.py — shared one-shot preview layer (image decode, single predict, no SDK)
+#     cw_trainer.py           — shared training layer (dataset DL, WandB patch, API callbacks)
+#     smolvla_resolver.py     — model-specific: camera mapping, state/action dims
+#     smolvla_trainer.py      — model-specific: builds LeRobot training config
+#
 # This configuration enables SmolVLA inference and training for robot control.
 #
 # ============================================================================
@@ -86,8 +99,27 @@ cyberwave-cloud-node:
   # Installation script - sets up Python venv and LeRobot dependencies
   install_script: ./install.sh
 
-  # Inference endpoint - runs SmolVLA action prediction loop
-  # Loads model once, then processes frames and publishes actions via MQTT
+  # Inference: single entrypoint for both live and preview workloads.
+  #
+  # preview.py inspects the payload:
+  #   - Contains "robot_twin_uuid"  → live inference via deploy.py / CwProcessor (MQTT loop)
+  #   - Contains "mlmodel_uuid" only → playground preview via preview_server.py
+  #
+  # For preview workloads, preview.py self-manages preview_server.py:
+  #   - GET /health distinguishes "HTTP up, model loading" (ready:false) from
+  #     "no server" so we do not spawn duplicate FastAPI processes.
+  #   - A flock + ~/.cyberwave/smolvla_preview_server_state.json (pid) serialize
+  #     startup when several workloads race before the port is listening.
+  #   - Polls until the model is ready (PREVIEW_SERVER_LOAD_TIMEOUT, default 180s)
+  #     then POSTs /predict; on timeout, cold-starts inline.
+  #   - The daemon survives between preview.py runs (start_new_session).
+  #
+  # Environment variables for preview (set on the GPU node):
+  #   SMOLVLA_CHECKPOINT     Local path to SmolVLA checkpoint.
+  #   SMOLVLA_BASE_MODEL     Optional base model for PEFT checkpoints.
+  #   PREVIEW_SERVER_PORT    Port (default: 8765).
+  #   PREVIEW_SERVER_HOST    Bind host (default: 127.0.0.1).
+  #   PREVIEW_SERVER_LOAD_TIMEOUT  Seconds to wait for model load (default: 180).
   inference: |
     source "$HOME/.venv/smolvla/bin/activate" && \
     python deploy.py {body}
@@ -106,3 +138,25 @@ cyberwave-cloud-node:
   upload_results: true
 
   profile_slug: smolvla-policy
+
+  # Operator config, applied by the entrypoints before building their runtime
+  # config. Hierarchical, one subsection per entrypoint:
+  #   train:  consumed by train.py (see below)
+  #   deploy: reserved for inference/preview defaults — none for now
+  #
+  # config.train — defaults for any training field the JSON payload omits
+  # (explicit top-level payload params win). Accepts any training field:
+  # max_steps, batch_size, save_freq, log_freq, num_workers, lora_r,
+  # optimizer_lr, ... Total steps supports the aliases max_steps / steps /
+  # iterations, and an explicit value here OVERRIDES the training request's
+  # policy.max_iterations (handled in smolvla_trainer._resolve_max_steps).
+  #
+  # NOTE: the values below are tuned for quick smoke-test iteration. Raise
+  # save_freq / log_freq (and drop max_steps) before real training runs, or the
+  # job will checkpoint/log every few steps.
+  config:
+    train:
+      max_steps: 50000
+      save_freq: 10000
+      log_freq: 100
+    # deploy: {}   # reserved for inference/preview defaults (none for now)

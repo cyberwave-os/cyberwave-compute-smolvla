@@ -19,6 +19,18 @@ Expected JSON fields:
     - log_freq: Logging frequency (default: 100)
     - results_folder: Where to put compressed artifacts (default: ./runs/artifacts)
 
+Operator defaults: a hierarchical ``config:`` block in ``cyberwave.yml`` (under
+``cyberwave-cloud-node``) supplies defaults per entrypoint::
+
+    config:
+      train:  { max_steps: 5, save_freq: 5, ... }   # consumed here (train.py)
+      deploy: { ... }                                 # reserved (none yet)
+
+Any ``config.train`` key fills in for a field the JSON payload omits; explicit
+top-level payload params take priority. Total-steps supports ``max_steps`` /
+``steps`` / ``iterations`` and, when set, overrides the request's
+``policy.max_iterations`` (see smolvla_trainer._resolve_max_steps).
+
 Environment variables:
     - CYBERWAVE_API_KEY: Fallback auth token
     - CYBERWAVE_ENVIRONMENT: "production", "development", or "local"
@@ -45,6 +57,43 @@ def _setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def _load_yml_config(section: str = "train", *, yml_path: Path | None = None) -> dict:
+    """Return operator defaults from the ``config:`` block of cyberwave.yml.
+
+    Hierarchical layout::
+
+        cyberwave-cloud-node:
+          config:
+            train:  { ...training params... }   # consumed by train.py
+            deploy: { ...inference params... }   # reserved (none yet)
+
+    Returns the requested ``section``'s mapping (empty dict if absent). A legacy
+    flat ``config:`` mapping (no ``train``/``deploy`` subsections) is treated as
+    the ``train`` section for backward-compatibility.
+
+    Best-effort: returns ``{}`` when PyYAML or the file/block is missing, so the
+    feature never blocks training.
+    """
+    try:
+        import yaml
+
+        yml_path = yml_path or (Path(__file__).parent / "cyberwave.yml")
+        if not yml_path.exists():
+            return {}
+        with open(yml_path) as f:
+            data = yaml.safe_load(f) or {}
+        config = (data.get("cyberwave-cloud-node") or {}).get("config") or {}
+        if not isinstance(config, dict):
+            return {}
+        if any(k in config for k in ("train", "deploy")):
+            section_cfg = config.get(section) or {}
+            return section_cfg if isinstance(section_cfg, dict) else {}
+        # Legacy flat layout → treat as training defaults.
+        return config if section == "train" else {}
+    except Exception:
+        return {}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -81,6 +130,16 @@ def main(argv: list[str] | None = None) -> int:
             if key not in params:
                 params[key] = value
         cprint(f"Merged {len(nested)} nested params", C.DIM)
+
+    # Apply cyberwave.yml ``config.train`` defaults for any key the payload
+    # omitted. Explicit top-level JSON payload params always take priority.
+    # (Total-steps resolution — max_steps/steps/iterations vs policy.max_iterations
+    # — is handled in smolvla_trainer._resolve_max_steps.)
+    train_config = _load_yml_config("train")
+    applied = {k: v for k, v in train_config.items() if k not in params}
+    if applied:
+        params.update(applied)
+        cprint(f"Applied cyberwave.yml config.train defaults: {applied}", C.DIM)
 
     try:
         trainer = CwTrainer(params, model_slug=MODEL_SLUG)

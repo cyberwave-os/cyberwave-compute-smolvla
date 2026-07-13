@@ -309,3 +309,34 @@ class TestCwTrainerResults:
             trainer = CwTrainer(sample_training_payload, model_slug="smolvla")
 
             assert trainer.results_folder == Path("/custom/results")
+
+
+class TestBuildTrainingConfigOutputDir:
+    """Regression: cw_trainer must not pre-create output_dir (lerobot's
+    validate() raises if it already exists) and must pass it as a Path."""
+
+    def _make_trainer(self, params: dict[str, Any]) -> CwTrainer:
+        with patch("cw_trainer._get_trainer_registry") as reg:
+            reg.return_value = {"smolvla": lambda: MagicMock()}
+            return CwTrainer(params, model_slug="smolvla")
+
+    def test_output_dir_not_precreated_and_passed_as_path(self, tmp_path: Path) -> None:
+        out = tmp_path / "outrun"
+        params = {
+            "cyberwave_training_uuid": "t",
+            "environment": "production",
+            "output_dir": str(out),
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            trainer = self._make_trainer(params)
+            trainer.dataset_root = tmp_path / "ds"
+            trainer.base_model_path = "lerobot/smolvla_base"
+            trainer.dataset_repo_id = "local/x"
+            trainer.trainer.build_pipeline_config = MagicMock(  # type: ignore[method-assign]
+                return_value=MagicMock(steps=5, batch_size=2)
+            )
+            trainer._build_training_config()
+
+        assert not out.exists(), "output_dir must NOT be pre-created (trips lerobot validate())"
+        passed = trainer.trainer.build_pipeline_config.call_args.kwargs["output_dir"]
+        assert isinstance(passed, Path), "output_dir must be passed to the trainer as a Path"

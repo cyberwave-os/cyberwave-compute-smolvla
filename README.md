@@ -301,7 +301,7 @@ JSON result is written to stdout for orchestration:
 
 - [LeRobot](https://github.com/huggingface/lerobot) - Robot learning framework
 - [SmolVLA](https://huggingface.co/lerobot/smolvla) - Small Vision-Language-Action model
-- [Cyberwave](https://cyberwave.com) - Robot cloud infrastructure
+- [Cyberwave](https://cyberwave.com) - Physical AI Cloud Infrastructure
 
 ## License
 

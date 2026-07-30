@@ -9,8 +9,17 @@ PyYAML>=6.0  # train.py reads training defaults from cyberwave.yml (config: bloc
 fastapi>=0.100.0
 uvicorn>=0.24.0
 
-# LeRobot with SmolVLA extras
-lerobot[smolvla]
+# LeRobot with SmolVLA extras.
+#
+# Pinned <0.6.0: 0.6.0 renamed TrainPipelineConfig.eval_freq to env_eval_freq
+# (splitting held-out eval into eval_steps) and moved WandBLogger from
+# lerobot.rl.wandb_utils to lerobot.common.wandb_utils. Both are load-bearing here
+# (smolvla_trainer.build_pipeline_config, cw_trainer._patch_wandb_logger), and an
+# unpinned upgrade broke training with
+# "TypeError: TrainPipelineConfig.__init__() got an unexpected keyword argument 'eval_freq'".
+# Raising this pin means porting those two call sites — see tests/test_smolvla_trainer.py
+# TestLerobotApiCompat and tests/test_cw_trainer.py TestWandbLoggerPatch.
+lerobot[smolvla]>=0.5.1,<0.6.0
 
 # LoRA fine-tuning
 peft

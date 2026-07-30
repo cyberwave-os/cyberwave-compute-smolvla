@@ -31,12 +31,12 @@ dependencies = [
 inference = [
     "fastapi>=0.100.0",
     "uvicorn>=0.24.0",
-    "lerobot[smolvla]",
+    "lerobot[smolvla]>=0.5.1,<0.6.0",  # see requirements.txt for why <0.6.0
     "peft",
     "cyberwave>=0.3.46",
 ]
 training = [
-    "lerobot[smolvla]",
+    "lerobot[smolvla]>=0.5.1,<0.6.0",  # see requirements.txt for why <0.6.0
     "peft",
     "cyberwave>=0.3.46",
 ]

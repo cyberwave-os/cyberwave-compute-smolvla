@@ -340,3 +340,46 @@ class TestBuildTrainingConfigOutputDir:
         assert not out.exists(), "output_dir must NOT be pre-created (trips lerobot validate())"
         passed = trainer.trainer.build_pipeline_config.call_args.kwargs["output_dir"]
         assert isinstance(passed, Path), "output_dir must be passed to the trainer as a Path"
+
+
+class TestWandbLoggerPatch:
+    """Regression: ``_patch_wandb_logger`` swallows ImportError with a warning, so a
+    moved lerobot module degrades silently — training runs, but the Cyberwave API
+    never receives metrics, ETA or checkpoint events. lerobot 0.6.0 moved
+    ``WandBLogger`` from ``lerobot.rl.wandb_utils`` to ``lerobot.common.wandb_utils``
+    (hence the ``<0.6.0`` pin in requirements.txt); assert the patch really lands.
+    """
+
+    def test_patches_lerobot_wandb_logger(self) -> None:
+        pytest.importorskip("lerobot")
+        import lerobot.rl.wandb_utils as wandb_module
+
+        original = wandb_module.WandBLogger
+        params = {"cyberwave_training_uuid": "t", "environment": "production"}
+        with patch("cw_trainer._get_trainer_registry") as reg:
+            reg.return_value = {"smolvla": lambda: MagicMock()}
+            trainer = CwTrainer(params, model_slug="smolvla")
+        events: list[LogEvent] = []
+        # Must be set before patching: the patched class captures the callback then.
+        trainer._on_log_event = lambda e: events.append(e)  # type: ignore[method-assign]
+        try:
+            # patch.dict keeps the WANDB_MODE=disabled side effect out of other tests.
+            with patch.dict(os.environ, {}, clear=False):
+                trainer._patch_wandb_logger()
+
+            patched = wandb_module.WandBLogger
+            assert patched is not original, "lerobot's WandBLogger was not patched"
+            assert issubclass(patched, CyberwaveLogger)
+
+            cfg = MagicMock()
+            cfg.wandb = MagicMock(disable_artifact=False)
+            cfg.output_dir = "/tmp/output"
+            cfg.steps = 10
+
+            # lerobot constructs the logger with the config as its only argument.
+            patched(cfg).log_dict({"loss": 0.25}, step=1)
+
+            assert [e.event_type for e in events] == ["metrics"]
+            assert events[0].payload["loss"] == 0.25
+        finally:
+            wandb_module.WandBLogger = original

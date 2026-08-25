@@ -499,7 +499,7 @@ The system produces colorized terminal output showing:
 ══════════════════════════════════════════════════
   CYBERWAVE SETUP
 ══════════════════════════════════════════════════
-  API Key: cw_a9ce8...4bea
+  API Key: cw_your_api_key
   ✓ Client created
   ✓ MQTT connected
   ✓ Joints received: [-0.01, 0.01, 0.07, 0.02, -0.00, 0.12]

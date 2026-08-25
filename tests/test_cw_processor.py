@@ -126,6 +126,18 @@ class TestParseRequestPayload:
         assert "cam-1" in request.camera_twin_uuids
         assert "cam-2" in request.camera_twin_uuids
 
+    def test_parse_camera_slots_preserves_order_and_deduplicates(self) -> None:
+        request = parse_request_payload(
+            json.dumps(
+                {
+                    "robot_twin_uuid": "robot-1",
+                    "camera_slots": ["primary_camera", "wrist_camera", "primary_camera"],
+                }
+            )
+        )
+
+        assert request.camera_slots == ["primary_camera", "wrist_camera"]
+
     def test_parse_camera_endpoints_extracts_uuid_from_url(self) -> None:
         """Test that UUID is extracted from latest-frame URLs."""
         raw = json.dumps(

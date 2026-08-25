@@ -677,13 +677,13 @@ The logger also computes and sends ETA after ~100 steps via `update_type="estima
                     JSON Params
                          │
                          ▼
-┌──────────────────────────────────────────────────────────────┐
-│                      train.py                                │
-│                                                              │
-│   1. Parse params from Cloud Node                            │
-│   2. Create CwTrainer(model_slug="smolvla")                  │
-│                                                              │
-└────────────────────────┬─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                      train.py                               │
+│                                                             │
+│   1. Parse params from Cloud Node                           │
+│   2. Create CwTrainer(model_slug="smolvla")                 │
+│                                                             │
+└────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐

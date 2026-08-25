@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -342,44 +343,108 @@ class TestBuildTrainingConfigOutputDir:
         assert isinstance(passed, Path), "output_dir must be passed to the trainer as a Path"
 
 
-class TestWandbLoggerPatch:
-    """Regression: ``_patch_wandb_logger`` swallows ImportError with a warning, so a
-    moved lerobot module degrades silently — training runs, but the Cyberwave API
-    never receives metrics, ETA or checkpoint events. lerobot 0.6.0 moved
-    ``WandBLogger`` from ``lerobot.rl.wandb_utils`` to ``lerobot.common.wandb_utils``
-    (hence the ``<0.6.0`` pin in requirements.txt); assert the patch really lands.
+class TestCompressResults:
+    """Tests for CwTrainer._compress_results (training artifact tarball).
+
+    Regression guard: lerobot writes ``checkpoints/last`` as a *symlink* to the
+    final numbered checkpoint (``050000`` for a 50k-step run, ``000005`` for a
+    5-step smoke test). ``tarfile.add()`` does not dereference symlinks, so
+    tarring ``last`` directly produced a ~200 byte archive holding one dangling
+    link entry instead of the weights.
     """
 
-    def test_patches_lerobot_wandb_logger(self) -> None:
-        pytest.importorskip("lerobot")
-        import lerobot.rl.wandb_utils as wandb_module
-
-        original = wandb_module.WandBLogger
-        params = {"cyberwave_training_uuid": "t", "environment": "production"}
+    def _make_trainer(self, params: dict[str, Any]) -> CwTrainer:
         with patch("cw_trainer._get_trainer_registry") as reg:
             reg.return_value = {"smolvla": lambda: MagicMock()}
-            trainer = CwTrainer(params, model_slug="smolvla")
-        events: list[LogEvent] = []
-        # Must be set before patching: the patched class captures the callback then.
-        trainer._on_log_event = lambda e: events.append(e)  # type: ignore[method-assign]
-        try:
-            # patch.dict keeps the WANDB_MODE=disabled side effect out of other tests.
-            with patch.dict(os.environ, {}, clear=False):
-                trainer._patch_wandb_logger()
+            return CwTrainer(params, model_slug="smolvla")
 
-            patched = wandb_module.WandBLogger
-            assert patched is not original, "lerobot's WandBLogger was not patched"
-            assert issubclass(patched, CyberwaveLogger)
+    def _make_checkpoint(self, root: Path, step: str, *, payload: int = 4096) -> Path:
+        """Create a lerobot-shaped checkpoint dir and return it."""
+        ckpt = root / "checkpoints" / step
+        (ckpt / "pretrained_model").mkdir(parents=True)
+        (ckpt / "training_state").mkdir(parents=True)
+        # Incompressible bytes: real safetensors barely gzip, and a compressible
+        # stand-in would mask a size regression.
+        (ckpt / "pretrained_model" / "adapter_model.safetensors").write_bytes(
+            os.urandom(payload)
+        )
+        (ckpt / "pretrained_model" / "adapter_config.json").write_text('{"r": 16}')
+        (ckpt / "pretrained_model" / "config.json").write_text('{"type": "smolvla"}')
+        (ckpt / "training_state" / "training_step.json").write_text('{"step": 1}')
+        return ckpt
 
-            cfg = MagicMock()
-            cfg.wandb = MagicMock(disable_artifact=False)
-            cfg.output_dir = "/tmp/output"
-            cfg.steps = 10
+    def _trainer_for(self, tmp_path: Path) -> CwTrainer:
+        trainer = self._make_trainer(
+            {
+                "cyberwave_training_uuid": "run-abc",
+                "environment": "production",
+                "results_folder": str(tmp_path / "artifacts"),
+            }
+        )
+        trainer.output_dir = tmp_path / "out"
+        return trainer
 
-            # lerobot constructs the logger with the config as its only argument.
-            patched(cfg).log_dict({"loss": 0.25}, step=1)
+    @staticmethod
+    def _members(artifact: Path) -> dict[str, tarfile.TarInfo]:
+        with tarfile.open(artifact, "r:gz") as tar:
+            return {m.name: m for m in tar.getmembers()}
 
-            assert [e.event_type for e in events] == ["metrics"]
-            assert events[0].payload["loss"] == 0.25
-        finally:
-            wandb_module.WandBLogger = original
+    def test_last_symlink_is_dereferenced(self, tmp_path: Path) -> None:
+        """``checkpoints/last`` as a symlink must still archive the real weights."""
+        trainer = self._trainer_for(tmp_path)
+        self._make_checkpoint(trainer.output_dir, "050000")
+        os.symlink("050000", trainer.output_dir / "checkpoints" / "last")
+
+        artifact = trainer._compress_results()
+
+        members = self._members(artifact)
+        assert not any(m.issym() or m.islnk() for m in members.values()), (
+            f"artifact must contain no link entries, got: "
+            f"{[n for n, m in members.items() if m.issym() or m.islnk()]}"
+        )
+        assert "checkpoint/pretrained_model/adapter_model.safetensors" in members
+        assert members["checkpoint/pretrained_model/adapter_model.safetensors"].size == 4096
+        assert "checkpoint/training_state/training_step.json" in members
+
+    def test_smoke_test_step_count_is_not_hardcoded(self, tmp_path: Path) -> None:
+        """A 5-step run names the dir ``000005``; resolution must not assume 050000."""
+        trainer = self._trainer_for(tmp_path)
+        self._make_checkpoint(trainer.output_dir, "000005")
+        os.symlink("000005", trainer.output_dir / "checkpoints" / "last")
+
+        members = self._members(trainer._compress_results())
+
+        assert "checkpoint/pretrained_model/adapter_model.safetensors" in members
+
+    def test_last_as_real_directory_still_works(self, tmp_path: Path) -> None:
+        """Some runs materialise ``last`` as a real directory rather than a link."""
+        trainer = self._trainer_for(tmp_path)
+        self._make_checkpoint(trainer.output_dir, "last")
+
+        members = self._members(trainer._compress_results())
+
+        assert "checkpoint/pretrained_model/adapter_model.safetensors" in members
+
+    def test_fallback_picks_newest_numbered_checkpoint(self, tmp_path: Path) -> None:
+        """With no ``last``, fall back to the most recent checkpoint - dereferenced."""
+        trainer = self._trainer_for(tmp_path)
+        self._make_checkpoint(trainer.output_dir, "010000", payload=1024)
+        newest = self._make_checkpoint(trainer.output_dir, "020000", payload=8192)
+        os.utime(newest, (2_000_000_000, 2_000_000_000))
+
+        members = self._members(trainer._compress_results())
+
+        assert not any(m.issym() or m.islnk() for m in members.values())
+        assert members["checkpoint/pretrained_model/adapter_model.safetensors"].size == 8192
+
+    def test_artifact_is_not_trivially_small(self, tmp_path: Path) -> None:
+        """Guards the observed failure mode: a ~200 byte 'successful' artifact."""
+        trainer = self._trainer_for(tmp_path)
+        self._make_checkpoint(trainer.output_dir, "050000", payload=200_000)
+        os.symlink("050000", trainer.output_dir / "checkpoints" / "last")
+
+        artifact = trainer._compress_results()
+
+        assert artifact.stat().st_size > 1024, (
+            f"artifact is {artifact.stat().st_size} bytes - weights are missing"
+        )

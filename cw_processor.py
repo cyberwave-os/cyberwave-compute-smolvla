@@ -124,6 +124,9 @@ class InferenceRequest:
     instruction: str = "perform the requested task"
     camera_twin_uuids: list[str] = field(default_factory=list)
     camera_endpoints_by_role: dict[str, str] = field(default_factory=dict)
+    # Ordered training-camera contract from SmolVLAControllerPolicyMetadata.
+    # Empty is a legacy payload and falls back to the checkpoint configuration.
+    camera_slots: list[str] = field(default_factory=list)
     camera_sensor_ids: list[str] = field(default_factory=list)
     twin_calibration: dict[str, dict[str, float]] = field(default_factory=dict)
     calibration_robot_type: str | None = None
@@ -280,6 +283,12 @@ def parse_request_payload(raw_payload: str) -> InferenceRequest:
     camera_endpoints_by_role = _coerce_mapping(
         _get_param(params, "camera_endpoints_by_role", "cameraEndpointsByRole", {})
     )
+    camera_slots_raw = _coerce_list(
+        _get_param(params, "camera_slots", "cameraSlots", [])
+    )
+    camera_slots = list(
+        dict.fromkeys(slot.strip() for slot in camera_slots_raw if slot.strip())
+    )
     camera_twin_uuids = _coerce_list(
         _get_param(params, "camera_twin_uuids", "cameraTwinUuids", [])
     )
@@ -308,6 +317,7 @@ def parse_request_payload(raw_payload: str) -> InferenceRequest:
         camera_endpoints_by_role={
             key: str(value) for key, value in camera_endpoints_by_role.items()
         },
+        camera_slots=camera_slots,
         camera_sensor_ids=_coerce_list(
             _get_param(params, "camera_sensor_ids", "cameraSensorIds", [])
         ),
@@ -928,10 +938,11 @@ class CwProcessor:
             cprint(f"  ✓ Joint count matches model: {self.num_joints} joints", C.GREEN)
 
     def _build_camera_mapping(self) -> None:
-        """Build camera mapping using resolver and runtime camera config."""
-        if not self.resolver.training_camera_names:
+        """Build camera mapping from controller slots, with checkpoint fallback."""
+        camera_contract = self.request.camera_slots or self.resolver.training_camera_names
+        if not camera_contract:
             logger.warning(
-                "Resolver has no training camera names - skipping camera mapping"
+                "No controller or checkpoint camera names available - skipping camera mapping"
             )
             return
 
@@ -943,8 +954,27 @@ class CwProcessor:
         else:
             logger.warning(
                 "Training expects %d cameras but no runtime cameras provided",
-                len(self.resolver.training_camera_names),
+                len(camera_contract),
             )
+            return
+
+        if self.request.camera_slots:
+            runtime_names = (
+                list(runtime_cameras)
+                if isinstance(runtime_cameras, dict)
+                else runtime_cameras
+            )
+            self.camera_mapping = {
+                camera_slot: runtime_names[index]
+                for index, camera_slot in enumerate(camera_contract)
+                if index < len(runtime_names)
+            }
+            if len(self.camera_mapping) < len(camera_contract):
+                logger.warning(
+                    "Controller expects %d cameras but only %d runtime camera(s) were provided",
+                    len(camera_contract),
+                    len(runtime_names),
+                )
             return
 
         self.camera_mapping = self.resolver.build_camera_mapping(runtime_cameras)

@@ -42,6 +42,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -169,6 +170,82 @@ def _align_state(state: np.ndarray, expected_dim: int) -> np.ndarray:
     return state
 
 
+def declared_camera_names(cfg: SmolVLAConfig) -> list[str]:
+    """Camera short names the policy expects, in config order.
+
+    ``empty_camera`` slots are excluded: those are synthesised as zero frames
+    rather than sourced from the runtime.
+    """
+    return [
+        key.split("observation.images.")[-1]
+        for key, pf in cfg.input_features.items()
+        if pf.type == FeatureType.VISUAL and "empty_camera" not in key
+    ]
+
+
+def resolve_camera_inputs(
+    cfg: SmolVLAConfig, images: dict[str, np.ndarray]
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    """Map runtime frames onto the policy's declared cameras, best-effort.
+
+    Exact name matches win first, then any still-unclaimed camera is filled
+    positionally from the leftover frames — mirroring the positional mapping
+    ``SmolVLAResolver.build_camera_mapping`` already performs upstream. Cameras
+    left with no frame are reported as missing rather than raising, because
+    ``SmolVLAPolicy.prepare_images`` masks absent views and can still run.
+
+    Returns:
+        (frames keyed by declared camera name, names with no frame)
+    """
+    declared = declared_camera_names(cfg)
+    return resolve_named_camera_inputs(declared, images)
+
+
+def resolve_named_camera_inputs(
+    declared: list[str], images: dict[str, np.ndarray]
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    """Map runtime frames onto an ordered camera contract, best-effort."""
+
+    mapped: dict[str, np.ndarray] = {
+        name: images[name] for name in declared if name in images
+    }
+    unmatched = [name for name in declared if name not in mapped]
+    leftovers = [key for key in images if key not in mapped]
+    # strict=False is deliberate: pairing stops at whichever runs out, leaving any
+    # surplus camera unmapped (reported as missing) and surplus frames unused.
+    for name, key in zip(unmatched, leftovers, strict=False):
+        mapped[name] = images[key]
+
+    missing = [name for name in declared if name not in mapped]
+    return mapped, missing
+
+
+def map_camera_inputs_positionally(
+    declared: list[str], images: dict[str, np.ndarray]
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    """Translate an already ordered camera contract to model feature names."""
+    mapped = {
+        name: images[key] for name, key in zip(declared, images, strict=False)
+    }
+    missing = [name for name in declared if name not in mapped]
+    return mapped, missing
+
+
+def frame_features_for_available(
+    ds_features: dict[str, dict], missing_cameras: list[str]
+) -> dict[str, dict]:
+    """Drop absent cameras from the feature spec.
+
+    LeRobot's ``build_dataset_frame`` indexes the raw observation directly for
+    every visual feature it is handed, so an absent camera must be removed here
+    or it raises a KeyError before the policy ever gets a chance to mask it.
+    """
+    if not missing_cameras:
+        return ds_features
+    absent = {f"observation.images.{name}" for name in missing_cameras}
+    return {key: spec for key, spec in ds_features.items() if key not in absent}
+
+
 def raw_observation_from_tensors(
     cfg: SmolVLAConfig,
     ds_features: dict[str, dict],
@@ -192,10 +269,9 @@ def raw_observation_from_tensors(
             raw[short] = np.zeros((h, w, c), dtype=np.uint8)
             continue
         if short not in images:
-            raise KeyError(
-                f"Missing image array for camera {short!r} (policy expects {key}). "
-                f"Got keys: {sorted(images)}"
-            )
+            # Best-effort: keep the control cycle alive with the views we do have.
+            # The caller drops this camera from ds_features so LeRobot skips it.
+            continue
         img = images[short]
         if img.ndim != 3:
             raise ValueError(f"Image {short} must be HWC (uint8 RGB); got shape {img.shape}")
@@ -253,6 +329,81 @@ def _get_base_model_from_peft_config(checkpoint: str) -> str | None:
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Failed to read adapter_config.json: %s", e)
         return None
+
+
+def load_checkpoint_policy_config(
+    checkpoint: str, device: torch.device
+) -> SmolVLAConfig | None:
+    """Parse the fine-tuned checkpoint's own ``config.json``.
+
+    A PEFT checkpoint ships only ``adapter_model.safetensors``, so the policy has
+    to be built from the base model's weights — but it must be built against the
+    *fine-tuned* feature contract. ``lerobot/smolvla_base`` declares
+    ``camera1/2/3`` @ 256x256; a checkpoint trained on, say, ``wrist``/``top`` @
+    480x640 declares those instead. Taking the config from the base model serves
+    camera names the runtime never sends.
+
+    ``compile_model`` is cleared here rather than after construction: training
+    checkpoints commonly carry ``compile_model=true`` and the policy compiles
+    inside ``__init__``, so clearing it later has no effect.
+
+    Returns None when the checkpoint has no parseable config, letting the caller
+    fall back to the base model's config.
+    """
+    cfg_path = Path(checkpoint) / "config.json"
+    if not cfg_path.is_file():
+        return None
+
+    try:
+        cfg = PreTrainedConfig.from_pretrained(checkpoint)
+    except Exception as e:
+        # A checkpoint written by a newer LeRobot can carry config keys this
+        # version's dataclass rejects (e.g. compile_model/compile_mode). Those
+        # are not needed for inference, so drop unknowns rather than refuse.
+        logger.warning("Strict config parse failed for %s (%s); retrying leniently", checkpoint, e)
+        cfg = _parse_config_ignoring_unknown_fields(cfg_path)
+        if cfg is None:
+            return None
+
+    cfg.device = str(device)
+    cfg.compile_model = False
+    return cfg
+
+
+def _parse_config_ignoring_unknown_fields(cfg_path: Path) -> SmolVLAConfig | None:
+    """Re-parse a policy config with fields unknown to this LeRobot removed."""
+    import tempfile
+
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Could not read %s: %s", cfg_path, e)
+        return None
+    if not isinstance(raw, dict):
+        return None
+
+    known = set(getattr(SmolVLAConfig, "__dataclass_fields__", {}))
+    # 'type' is draccus' choice discriminator, not a dataclass field.
+    dropped = sorted(key for key in raw if key not in known)
+    for key in dropped:
+        raw.pop(key)
+    if dropped:
+        logger.warning("Ignoring unknown policy config fields: %s", ", ".join(dropped))
+
+    tmp_path = None
+    try:
+        import draccus
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
+            json.dump(raw, tmp)
+            tmp_path = tmp.name
+        return draccus.parse(SmolVLAConfig, tmp_path, args=[])
+    except Exception as e:
+        logger.warning("Lenient config parse also failed for %s: %s", cfg_path, e)
+        return None
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 def _apply_hf_offline_from_env() -> bool:
@@ -315,6 +466,7 @@ def build_predict_fn(
     robot_type: str = "",
     device: torch.device | None = None,
     base_model: str | None = None,
+    camera_slots: list[str] | None = None,
 ) -> PredictFn:
     """Load SmolVLA model and return a predict_fn for per-step inference.
 
@@ -326,6 +478,8 @@ def build_predict_fn(
         robot_type: Optional robot_type string for multi-embodiment models
         device: torch device (defaults to cuda/mps/cpu auto-detect)
         base_model: For PEFT checkpoints, the base model to load
+        camera_slots: Ordered controller-policy camera contract. When absent,
+            use the camera names recorded in the checkpoint.
 
     Returns:
         predict_fn(inputs) -> raw action tensor [1, chunk_size, action_dim]
@@ -359,7 +513,23 @@ def build_predict_fn(
             base_model = "lerobot/smolvla_base"
 
         logger.info("PEFT checkpoint detected. Using base model: %s", base_model)
-        policy = SmolVLAPolicy.from_pretrained(base_model)
+        # Weights come from the base model, but the feature contract must come from
+        # the checkpoint: the adapter was fitted against the fine-tuned camera
+        # names/dims, and smolvla_base declares entirely different ones.
+        checkpoint_cfg = load_checkpoint_policy_config(checkpoint, device)
+        if checkpoint_cfg is None:
+            logger.warning(
+                "No usable config.json in %s; falling back to the base model's feature "
+                "contract. Camera names may not match the ones used for training.",
+                checkpoint,
+            )
+            policy = SmolVLAPolicy.from_pretrained(base_model)
+        else:
+            logger.info(
+                "Using fine-tuned feature contract from checkpoint (cameras=%s)",
+                declared_camera_names(checkpoint_cfg),
+            )
+            policy = SmolVLAPolicy.from_pretrained(base_model, config=checkpoint_cfg)
 
         logger.info("Applying PEFT adapter from: %s", checkpoint)
         peft_policy = PeftModel.from_pretrained(policy, checkpoint)
@@ -385,6 +555,15 @@ def build_predict_fn(
     assert isinstance(cfg, SmolVLAConfig)
     ds_features = dataset_features_from_policy(cfg)
     expected_state_dim = ds_features[OBS_STATE]["shape"][0]
+    configured_camera_names = declared_camera_names(cfg)
+    authoritative_camera_slots = list(dict.fromkeys(camera_slots or []))
+    camera_contract = authoritative_camera_slots or configured_camera_names
+    if authoritative_camera_slots:
+        logger.info(
+            "Using controller-policy camera contract %s; checkpoint camera names %s are fallback only",
+            authoritative_camera_slots,
+            configured_camera_names,
+        )
     logger.info("SmolVLA policy loaded (state_dim=%d)", expected_state_dim)
 
     _infer_calls: dict[str, Any] = {"n": 0, "quiet": False}
@@ -415,7 +594,39 @@ def build_predict_fn(
         t_align = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        obs = raw_observation_from_tensors(cfg, ds_features, images, state)
+        # Controller metadata defines the physical-camera contract. Translate
+        # those ordered slots into the config's internal feature keys only at
+        # the model boundary; legacy workloads omit slots and use config names.
+        contract_images, missing_contract_cameras = resolve_named_camera_inputs(
+            camera_contract, images
+        )
+        mapped_images, missing_cameras = map_camera_inputs_positionally(
+            configured_camera_names, contract_images
+        )
+        # Log only when the mapping changes — predict() runs at the control rate.
+        cam_signature = (
+            tuple(sorted(images)),
+            tuple(missing_contract_cameras),
+            tuple(missing_cameras),
+        )
+        if _infer_calls.get("cam_signature") != cam_signature:
+            _infer_calls["cam_signature"] = cam_signature
+            logger.info(
+                "Camera resolution: controller expects %s, runtime supplied %s -> using %s",
+                camera_contract,
+                sorted(images),
+                sorted(mapped_images),
+            )
+            if missing_cameras:
+                logger.warning(
+                    "No frames for model camera(s) %s; running with %d of %d views. The policy "
+                    "was trained with all of them, so actions will be degraded.",
+                    missing_cameras,
+                    len(mapped_images),
+                    len(mapped_images) + len(missing_cameras),
+                )
+        frame_features = frame_features_for_available(ds_features, missing_cameras)
+        obs = raw_observation_from_tensors(cfg, frame_features, mapped_images, state)
         t_obs = time.perf_counter() - t0
         if not quiet:
             logger.info(
@@ -426,7 +637,7 @@ def build_predict_fn(
 
         t0 = time.perf_counter()
         frame = build_inference_frame(
-            obs, device, ds_features, task=instruction, robot_type=robot_type
+            obs, device, frame_features, task=instruction, robot_type=robot_type
         )
         t_frame = time.perf_counter() - t0
         if not quiet:
@@ -523,14 +734,9 @@ def build_predict_fn(
             "SMOLVLA_SKIP_GPU_WARMUP set: skipping GPU warmup (first inference may be very slow)"
         )
 
-    # Expose the camera short-names the policy was trained with so callers
-    # (e.g. CwProcessorPreview) can build the images dict with the correct keys
-    # without needing a separate resolver pass.
-    predict.training_camera_names = [  # type: ignore[attr-defined]
-        key.split("observation.images.")[-1]
-        for key, pf in cfg.input_features.items()
-        if pf.type == FeatureType.VISUAL and "empty_camera" not in key
-    ]
+    # Expose the controller contract when available; callers should not need to
+    # know checkpoint-internal feature names.
+    predict.training_camera_names = camera_contract  # type: ignore[attr-defined]
     predict.expected_state_dim = expected_state_dim  # type: ignore[attr-defined]
 
     # action_out_dim = int(ds_features[ACTION]["shape"][0])
@@ -636,6 +842,7 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint,
             robot_type=robot_type,
             base_model=os.environ.get("SMOLVLA_BASE_MODEL") or request.policy_repo_id,
+            camera_slots=request.camera_slots,
         )
 
         # CwProcessor handles all Cyberwave I/O and data transformations

@@ -834,13 +834,20 @@ class CwTrainer:
         if self.output_dir is None:
             raise RuntimeError("No output_dir set")
 
-        checkpoint_dir = self.output_dir / "checkpoints" / "last"
-        if not checkpoint_dir.exists():
-            candidates = list((self.output_dir / "checkpoints").glob("*"))
+        # lerobot writes ``checkpoints/last`` as a symlink to the final numbered
+        # checkpoint (``050000`` for a 50k-step run, ``000005`` for a smoke test),
+        # so the name can't be hardcoded. resolve() is required because
+        # ``tarfile.add()`` does NOT dereference symlinks: pointing it at the link
+        # archives a single dangling link entry (~200 bytes) instead of the weights.
+        checkpoint_dir = (self.output_dir / "checkpoints" / "last").resolve()
+        if not checkpoint_dir.is_dir():
+            candidates = [
+                p.resolve() for p in (self.output_dir / "checkpoints").glob("*") if p.is_dir()
+            ]
             if candidates:
                 checkpoint_dir = max(candidates, key=lambda p: p.stat().st_mtime)
             else:
-                checkpoint_dir = self.output_dir
+                checkpoint_dir = self.output_dir.resolve()
 
         self.results_folder.mkdir(parents=True, exist_ok=True)
         artifact_name = f"{self.training_uuid or 'checkpoint'}.tar.gz"
@@ -848,11 +855,24 @@ class CwTrainer:
 
         cprint(f"  Compressing {checkpoint_dir} -> {artifact_path}", C.CYAN)
 
+        n_files = 0
         with tarfile.open(artifact_path, "w:gz") as tar:
             tar.add(checkpoint_dir, arcname="checkpoint")
+            n_files = sum(1 for m in tar.getmembers() if m.isfile())
+
+        # Fail loudly rather than shipping an empty "success". A silently weightless
+        # artifact costs a full training run before anyone notices.
+        if n_files == 0:
+            raise RuntimeError(
+                f"Refusing to publish an empty training artifact: no regular files found "
+                f"under {checkpoint_dir}. Training produced no usable checkpoint."
+            )
 
         size_mb = artifact_path.stat().st_size / (1024 * 1024)
-        cprint(f"  Artifact created: {artifact_path} ({size_mb:.1f}MB)", C.GREEN)
+        cprint(
+            f"  Artifact created: {artifact_path} ({size_mb:.1f}MB, {n_files} files)",
+            C.GREEN,
+        )
 
         return artifact_path
 

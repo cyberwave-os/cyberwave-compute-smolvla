@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -39,6 +40,30 @@ def small_valid_jpeg() -> bytes:
 
 class TestCameraBindings:
     """Tests for camera binding and background fetcher functionality."""
+
+    def test_controller_slots_override_checkpoint_camera_mapping(
+        self,
+        mock_predict_fn: MagicMock,
+        temp_checkpoint_dir: Path,
+    ) -> None:
+        from cw_processor import CwProcessor, InferenceRequest
+
+        request = InferenceRequest(
+            robot_twin_uuid="robot-uuid",
+            camera_slots=["top", "wrist"],
+            camera_endpoints_by_role={"top": "top-uuid", "wrist": "wrist-uuid"},
+        )
+        processor = CwProcessor(
+            request,
+            model_slug="smolvla",
+            checkpoint=str(temp_checkpoint_dir),
+            predict_fn=mock_predict_fn,
+        )
+        processor.resolver = SimpleNamespace(training_camera_names=["stale_checkpoint_camera"])
+
+        processor._build_camera_mapping()
+
+        assert processor.camera_mapping == {"top": "top", "wrist": "wrist"}
 
     def test_camera_binding_created_for_mapped_cameras(
         self,
